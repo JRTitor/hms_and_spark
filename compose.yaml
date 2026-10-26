@@ -1,0 +1,168 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: hms-postgres
+    environment:
+      POSTGRES_DB: metastore
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: hive_dev_password
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./tests:/tests:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hive -d metastore"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.50
+    container_name: hms-s3
+    environment:
+      AWS_ACCESS_KEY_ID: spark_local
+      AWS_SECRET_ACCESS_KEY: spark_local_secret
+      S3_BUCKET: warehouse
+    command: ["mini", "-dir=/data"]
+    ports:
+      - "127.0.0.1:8333:8333"
+    volumes:
+      - seaweed-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -S -O /dev/null http://127.0.0.1:8333 2>&1 | grep -q 'HTTP/'"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+
+  metastore:
+    build:
+      context: ./hms
+    image: local/hive-metastore:4.0.0
+    container_name: hms-metastore
+    depends_on:
+      postgres:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      HADOOP_CLASSPATH: /opt/hadoop/share/hadoop/tools/lib/*
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/iceberg_metastore
+        -Djavax.jdo.option.ConnectionUserName=hive
+        -Djavax.jdo.option.ConnectionPassword=hive_dev_password
+        -Dhive.metastore.warehouse.dir=s3a://warehouse/spark-warehouse
+        -Dmetastore.try.direct.sql.ddl=false
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - >-
+        export HIVE_CONF_DIR=/opt/hive/conf;
+        export HADOOP_CLIENT_OPTS="-Xmx1G $$SERVICE_OPTS";
+        export HADOOP_CLASSPATH="/opt/hadoop/share/hadoop/tools/lib/*:$$HADOOP_CLASSPATH";
+        /opt/hive/bin/schematool -dbType postgres -initOrUpgradeSchema;
+        exec /opt/hive/bin/hive --skiphadoopversion --skiphbasecp --service metastore
+        --hiveconf hive.metastore.warehouse.dir=s3a://warehouse/spark-warehouse
+        --hiveconf fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+        --hiveconf fs.s3a.endpoint=http://seaweedfs:8333
+        --hiveconf fs.s3a.endpoint.region=us-east-1
+        --hiveconf fs.s3a.path.style.access=true
+        --hiveconf fs.s3a.connection.ssl.enabled=false
+        --hiveconf fs.s3a.access.key=spark_local
+        --hiveconf fs.s3a.secret.key=spark_local_secret
+        --hiveconf fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
+    ports:
+      - "127.0.0.1:9083:9083"
+    healthcheck:
+      test: ["CMD", "bash", "-ec", "exec 3<>/dev/tcp/127.0.0.1/9083"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  spark:
+    build:
+      context: ./spark
+    image: local/spark-thrift:4.0.1
+    container_name: spark-thrift
+    depends_on:
+      metastore:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    command:
+      - /opt/spark/bin/spark-submit
+      - --class
+      - org.apache.spark.sql.hive.thriftserver.HiveThriftServer2
+      - --master
+      - local[*]
+      - --conf
+      - spark.sql.catalogImplementation=hive
+      - --conf
+      - spark.sql.hive.metastore.version=4.0.0
+      - --conf
+      - spark.sql.hive.metastore.jars=maven
+      - --conf
+      - spark.hive.metastore.uris=thrift://metastore:9083
+      - --conf
+      - spark.hive.metastore.warehouse.dir=s3a://warehouse/spark-warehouse
+      - --conf
+      - spark.sql.warehouse.dir=s3a://warehouse/spark-warehouse
+      - --conf
+      - spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+      - --conf
+      - spark.sql.catalog.iceberg=org.apache.iceberg.spark.SparkCatalog
+      - --conf
+      - spark.sql.catalog.iceberg.type=hive
+      - --conf
+      - spark.sql.catalog.iceberg.uri=thrift://metastore:9083
+      - --conf
+      - spark.sql.catalog.iceberg.warehouse=s3a://warehouse/spark-warehouse
+      - --conf
+      - spark.sql.catalog.iceberg.io-impl=org.apache.iceberg.hadoop.HadoopFileIO
+      - --conf
+      - spark.jars.packages=org.apache.hadoop:hadoop-aws:3.4.1,org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.12.0
+      - --conf
+      - spark.driver.extraJavaOptions=-Duser.home=/opt/spark/ivy
+      - --conf
+      - spark.jars.ivy=/opt/spark/ivy
+      - --conf
+      - spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+      - --conf
+      - spark.hadoop.fs.s3a.endpoint=http://seaweedfs:8333
+      - --conf
+      - spark.hadoop.fs.s3a.endpoint.region=us-east-1
+      - --conf
+      - spark.hadoop.fs.s3a.path.style.access=true
+      - --conf
+      - spark.hadoop.fs.s3a.connection.ssl.enabled=false
+      - --conf
+      - spark.hadoop.fs.s3a.access.key=spark_local
+      - --conf
+      - spark.hadoop.fs.s3a.secret.key=spark_local_secret
+      - --conf
+      - spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
+      - --hiveconf
+      - hive.server2.thrift.bind.host=0.0.0.0
+      - --hiveconf
+      - hive.server2.thrift.port=10000
+    ports:
+      - "127.0.0.1:10000:10000"
+    volumes:
+      - ./tests:/tests:ro
+      - spark-ivy-cache:/opt/spark/ivy
+    healthcheck:
+      test: ["CMD", "bash", "-ec", "exec 3<>/dev/tcp/127.0.0.1/10000"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 600s
+
+volumes:
+  postgres-data:
+  seaweed-data:
+  spark-ivy-cache:
